@@ -1,0 +1,16 @@
+syntax = "proto3";
+package wolfeymetrics;
+
+message ImportRequest {
+    uint64 stream_id = 1;
+    repeated int64 timestamps = 2;
+    repeated int64 values = 3;
+}
+
+message ImportReply {
+    string message = 1;
+}
+
+service WolfeyMetrics {
+    rpc Import(ImportRequest) returns (ImportReply);
+}
