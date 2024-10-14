@@ -3,14 +3,54 @@ package wolfeymetrics;
 
 message ImportRequest {
     uint64 stream_id = 1;
-    repeated int64 timestamps = 2;
-    repeated int64 values = 3;
+    repeated int64 timestamp = 2;
+    repeated float value = 3;
 }
 
 message ImportReply {
     string message = 1;
 }
 
+enum Aggregation {
+    sum = 0;
+    mean = 1;
+    mode = 2;
+    median = 3;
+    min = 4;
+    max = 5;
+}
+
+message AggChartRequest {
+    repeated uint64 stream_ids = 1;
+    int64 start_unix_s = 2;
+    int64 stop_unix_s = 3;
+    uint32 step_s = 4;
+    Aggregation aggregation = 5;
+}
+message NonAggChartRequest {
+    repeated uint64 stream_ids = 1;
+    int64 start_unix_s = 2;
+    int64 stop_unix_s = 3;
+    uint32 step_s = 4;
+}
+
+message AggChartReply {
+    repeated int64 timestamps = 1;
+    repeated float value = 2;
+}
+
+message DataPoints {
+    repeated int64 timestamp = 2;
+    repeated float value = 3;
+}
+
+message NonAggChartReply {
+    repeated uint64 stream_id = 1;
+    repeated DataPoints datapoints = 2;
+}
+
 service WolfeyMetrics {
-    rpc Import(ImportRequest) returns (ImportReply);
+    rpc Import(stream ImportRequest) returns (ImportReply);
+    rpc AggChart(AggChartRequest) returns (AggChartReply);
+    rpc NonAggChart(NonAggChartRequest) returns (NonAggChartReply);
 }

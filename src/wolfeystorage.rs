@@ -1,6 +1,28 @@
-use std::{collections::HashMap, time::Duration};
+use dashmap::DashMap;
+use std::cmp::min;
+use std::sync::Arc;
+use std::usize;
+use std::{fmt::Debug, path::PathBuf, time::Duration};
+use tokio::task::JoinSet;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::RwLock;
+
+use crate::wolfey_metrics::{AggChartRequest, Aggregation, NonAggChartRequest};
+
+const DESIRED_STREAMS_PER_THREAD: usize = 100;
+
+#[derive(Debug, Copy, Clone)]
+struct Datapoint {
+    unix_s: i64,
+    value: f32,
+}
+struct DownsampledDatapoint {
+    time_index: usize,
+    value: f32,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CompressionOffset {
@@ -13,55 +35,264 @@ struct StorageConfig {
     min_pts_to_compress: usize,
     default_compression_level: usize,
     retention_period_s: usize,
-    data_interval_s: usize,
+    data_frequency_s: usize,
+    max_parallelism: usize,
+    stream_cache_ttl_s: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskStreamFileHeader {
+    stream_id: u64,
+    unix_s_byte_start: usize,
+    unix_s_byte_stop: usize,
+    values_byte_stop: usize,
+    compressed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TimePartitionFileHeader {
+    start_unix_s: i64,
+    file_path: PathBuf,
+    disk_streams: Vec<DiskStreamFileHeader>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PartitionsFileHeader {
+    // sorted descending start_unix_s
+    time_partitions: Vec<TimePartitionFileHeader>,
+}
+
+struct HotStream {
+    datapoints: Vec<Datapoint>,
+}
+
+struct Stream {
+    disk_header: DiskStreamFileHeader,
+    hot_stream: RwLock<Option<HotStream>>,
+}
+
+struct TimePartition {
+    start_unix_s: i64,
+    file_path: PathBuf,
+    streams: DashMap<u64, Stream>,
+}
+
+pub struct Storage {
+    config: StorageConfig,
+    partitions: Vec<TimePartition>,
+}
+
+#[derive(Clone, Copy)]
+struct ChartReqMetadata {
+    start_unix_s: i64,
+    stop_unix_s: i64,
+    step_s: u32,
+    resolution: usize,
+}
+
+#[inline]
+fn resolution(start_unix_s: i64, stop_unix_s: i64, step_s: u32) -> usize {
+    let duration_s = (stop_unix_s - start_unix_s) as u32;
+    let resolution = duration_s / step_s;
+    return resolution as usize;
+}
+
+impl ChartReqMetadata {
+    pub fn from_agg_chart_req(value: &AggChartRequest) -> Self {
+        Self {
+            start_unix_s: value.start_unix_s,
+            stop_unix_s: value.stop_unix_s,
+            step_s: value.step_s,
+            resolution: resolution(value.start_unix_s, value.stop_unix_s, value.step_s),
+        }
+    }
+    pub fn from_non_agg_chart_req(value: &NonAggChartRequest) -> Self {
+        Self {
+            start_unix_s: value.start_unix_s,
+            stop_unix_s: value.stop_unix_s,
+            step_s: value.step_s,
+            resolution: resolution(value.start_unix_s, value.stop_unix_s, value.step_s),
+        }
+    }
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            min_pts_to_compress: 8,
+            min_pts_to_compress: 10_000,
             default_compression_level: 8,
             retention_period_s: 7776000,
-            data_interval_s: 900,
+            data_frequency_s: 900,
+            max_parallelism: num_cpus::get(),
+            stream_cache_ttl_s: 900,
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct StreamFileHeader {
-    stream_id: u64,
-    unix_s_byte_start: u64,
-    unix_s_byte_stop: u64,
-    values_byte_stop: u64,
-    compressed: bool,
+impl HotStream {
+    pub async fn send_agg_chart(&self, req: ChartReqMetadata, tx: &Sender<DownsampledDatapoint>) {
+        for pt in &self.datapoints {
+            //TODO: only send downsampled pts, with time index
+            let _ = tx
+                .send(DownsampledDatapoint {
+                    time_index: 1,
+                    value: pt.value,
+                })
+                .await;
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-struct FileStorageHeader {
-    stream_file_headers: Vec<StreamFileHeader>,
+impl DiskStreamFileHeader {
+    async fn get_hot_stream_from_disk(&self, file_path: &PathBuf) -> HotStream {
+        todo!()
+    }
 }
 
-struct CompressedStream {
-    unix_s: Vec<u8>,
-    values: Vec<u8>,
+impl Stream {
+    pub async fn get_agg_chart(
+        &self,
+        req: ChartReqMetadata,
+        tx: &Sender<DownsampledDatapoint>,
+        file_path: &PathBuf,
+    ) {
+        let hot_stream_option = self.hot_stream.read().await;
+        if let Some(ref x) = *hot_stream_option {
+            x.send_agg_chart(req, &tx).await;
+            return;
+        }
+
+        let mut writable_hot_stream = self.hot_stream.write().await;
+
+        if let Some(ref x) = *writable_hot_stream {
+            x.send_agg_chart(req, &tx).await;
+            return;
+        }
+
+        let hot_stream_from_disk = self.disk_header.get_hot_stream_from_disk(file_path).await;
+        hot_stream_from_disk.send_agg_chart(req, &tx).await;
+        *writable_hot_stream = Some(hot_stream_from_disk);
+    }
 }
 
-#[derive(Debug)]
-struct Datapoint {
-    unix_s: i64,
-    value: f32,
+impl From<TimePartitionFileHeader> for TimePartition {
+    fn from(value: TimePartitionFileHeader) -> Self {
+        let hash_map = DashMap::new();
+        for x in value.disk_streams {
+            hash_map.insert(
+                x.stream_id,
+                Stream {
+                    disk_header: x,
+                    hot_stream: RwLock::new(None),
+                },
+            );
+        }
+        Self {
+            start_unix_s: value.start_unix_s,
+            streams: hash_map,
+            file_path: value.file_path,
+        }
+    }
 }
 
-struct DecompressedStream {
-    datapoints: Vec<Datapoint>,
+async fn get_agg_chart_from_partition(
+    time_partition: Arc<TimePartition>,
+    req: Arc<AggChartRequest>,
+    meta: ChartReqMetadata,
+    thread_idx: usize,
+    streams_per_thread: usize,
+    tx: Sender<DownsampledDatapoint>,
+) {
+    let start_stream_idx = streams_per_thread * thread_idx;
+    let end_stream = start_stream_idx + streams_per_thread;
+    let end_stream = min(req.stream_ids.len(), end_stream);
+    let stream_ids = &req.stream_ids[start_stream_idx..end_stream];
+    let streams = stream_ids
+        .iter()
+        .filter_map(|x| time_partition.streams.get(x));
+
+    for stream in streams {
+        stream
+            .get_agg_chart(meta, &tx, &time_partition.file_path)
+            .await;
+    }
 }
 
-enum InMemStream {
-    Compressed(CompressedStream),
-    Decompressed(DecompressedStream),
+async fn sum_datapoints(
+    mut rx: Receiver<DownsampledDatapoint>,
+    meta: ChartReqMetadata,
+) -> Vec<Datapoint> {
+    let mut buffer: Vec<DownsampledDatapoint> = Vec::with_capacity(meta.resolution);
+    let mut chart_values: Vec<Option<f32>> = vec![None; meta.resolution];
+
+    while rx.recv_many(&mut buffer, meta.resolution).await != 0 {
+        for pt in &buffer {
+            chart_values[pt.time_index] = match chart_values[pt.time_index] {
+                None => Some(pt.value),
+                Some(x) => Some(pt.value + x),
+            };
+        }
+    }
+
+    let datapoints = chart_values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, value)| match value {
+            Some(x) => Some(Datapoint {
+                unix_s: meta.start_unix_s + (meta.step_s as usize * idx) as i64,
+                value: x,
+            }),
+            None => None,
+        })
+        .collect();
+
+    return datapoints;
 }
 
-struct StreamsTable {
-    // stream_id -> stream
-    streams: HashMap<u64, InMemStream>,
+async fn get_agg_chart_from_partition_bulk(
+    time_partition: Arc<TimePartition>,
+    req: AggChartRequest,
+    max_threads: usize,
+) -> Vec<Datapoint> {
+    let meta = ChartReqMetadata::from_agg_chart_req(&req);
+
+    let num_requested_threads = req.stream_ids.len() / DESIRED_STREAMS_PER_THREAD;
+    let num_threads = min(num_requested_threads, max_threads);
+    let streams_per_thread = req.stream_ids.len() / num_threads;
+
+    let (tx, rx) = channel(meta.resolution);
+    let req = Arc::new(req);
+    let coros = (0..num_threads).map(|thread_idx| {
+        get_agg_chart_from_partition(
+            time_partition.clone(),
+            req.clone(),
+            meta,
+            thread_idx,
+            streams_per_thread,
+            tx.clone(),
+        )
+    });
+
+    let joinset = JoinSet::from_iter(coros);
+
+    joinset.join_all().await;
+
+    todo!()
+}
+impl Storage {
+    fn get_partitions_in_range(&self, start_unix_s: i64, stop_unix_s: i64) -> Vec<&TimePartition> {
+        let mut partition_end = Utc::now().timestamp();
+        let mut partitions_in_range = Vec::new();
+        for partition in &self.partitions {
+            if start_unix_s > partition_end {
+                return partitions_in_range;
+            }
+            partition_end = partition.start_unix_s;
+            if stop_unix_s < partition.start_unix_s {
+                continue;
+            }
+            partitions_in_range.push(partition);
+        }
+        return partitions_in_range;
+    }
 }

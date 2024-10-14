@@ -1,9 +1,11 @@
 use tonic::{transport::Server, Request, Response, Status};
 
+use tonic::Streaming;
 use wolfey_metrics::{
     wolfey_metrics_server::{WolfeyMetrics, WolfeyMetricsServer},
-    ImportReply, ImportRequest,
+    AggChartReply, AggChartRequest, ImportReply, ImportRequest,
 };
+use wolfey_metrics::{NonAggChartReply, NonAggChartRequest};
 
 pub mod wolfey_metrics {
     tonic::include_proto!("wolfeymetrics"); // The string specified here must match the proto package name
@@ -16,7 +18,7 @@ pub struct WolfeyMetricsService {}
 impl WolfeyMetrics for WolfeyMetricsService {
     async fn import(
         &self,
-        request: Request<ImportRequest>, // Accept request of type HelloRequest
+        request: Request<Streaming<ImportRequest>>, // Accept request of type HelloRequest
     ) -> Result<Response<ImportReply>, Status> {
         // Return an instance of type HelloReply
         println!("Got a request: {:?}", request);
@@ -27,6 +29,20 @@ impl WolfeyMetrics for WolfeyMetricsService {
         };
 
         Ok(Response::new(reply)) // Send back our formatted greeting
+    }
+
+    async fn non_agg_chart(
+        &self,
+        request: Request<NonAggChartRequest>,
+    ) -> Result<Response<NonAggChartReply>, Status> {
+        todo!()
+    }
+
+    async fn agg_chart(
+        &self,
+        request: Request<AggChartRequest>,
+    ) -> Result<Response<AggChartReply>, Status> {
+        todo!()
     }
 }
 
