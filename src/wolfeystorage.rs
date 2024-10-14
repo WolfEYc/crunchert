@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::cmp::min;
+use prost::UnknownEnumValue;
 use std::sync::Arc;
 use std::usize;
 use std::{fmt::Debug, path::PathBuf, time::Duration};
@@ -11,8 +11,6 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::wolfey_metrics::{AggChartRequest, Aggregation, NonAggChartRequest};
-
-const DESIRED_STREAMS_PER_THREAD: usize = 100;
 
 #[derive(Debug, Copy, Clone)]
 struct Datapoint {
@@ -196,26 +194,18 @@ impl From<TimePartitionFileHeader> for TimePartition {
 }
 
 async fn get_agg_chart_from_partition(
+    stream_id: u64,
     time_partition: Arc<TimePartition>,
-    req: Arc<AggChartRequest>,
     meta: ChartReqMetadata,
-    thread_idx: usize,
-    streams_per_thread: usize,
     tx: Sender<DownsampledDatapoint>,
 ) {
-    let start_stream_idx = streams_per_thread * thread_idx;
-    let end_stream = start_stream_idx + streams_per_thread;
-    let end_stream = min(req.stream_ids.len(), end_stream);
-    let stream_ids = &req.stream_ids[start_stream_idx..end_stream];
-    let streams = stream_ids
-        .iter()
-        .filter_map(|x| time_partition.streams.get(x));
+    let Some(stream) = time_partition.streams.get(&stream_id) else {
+        return;
+    };
 
-    for stream in streams {
-        stream
-            .get_agg_chart(meta, &tx, &time_partition.file_path)
-            .await;
-    }
+    stream
+        .get_agg_chart(meta, &tx, &time_partition.file_path)
+        .await;
 }
 
 async fn sum_datapoints(
@@ -252,32 +242,27 @@ async fn sum_datapoints(
 async fn get_agg_chart_from_partition_bulk(
     time_partition: Arc<TimePartition>,
     req: AggChartRequest,
-    max_threads: usize,
-) -> Vec<Datapoint> {
+) -> Result<Vec<Datapoint>, UnknownEnumValue> {
     let meta = ChartReqMetadata::from_agg_chart_req(&req);
 
-    let num_requested_threads = req.stream_ids.len() / DESIRED_STREAMS_PER_THREAD;
-    let num_threads = min(num_requested_threads, max_threads);
-    let streams_per_thread = req.stream_ids.len() / num_threads;
-
     let (tx, rx) = channel(meta.resolution);
-    let req = Arc::new(req);
-    let coros = (0..num_threads).map(|thread_idx| {
-        get_agg_chart_from_partition(
-            time_partition.clone(),
-            req.clone(),
-            meta,
-            thread_idx,
-            streams_per_thread,
-            tx.clone(),
-        )
-    });
+    let coros = req
+        .stream_ids
+        .into_iter()
+        .map(|x| get_agg_chart_from_partition(x, time_partition.clone(), meta, tx.clone()));
 
     let joinset = JoinSet::from_iter(coros);
+    tokio::spawn(joinset.join_all());
+    let aggregation = Aggregation::try_from(req.aggregation)?;
 
-    joinset.join_all().await;
-
-    todo!()
+    return Ok(match aggregation {
+        Aggregation::Sum => sum_datapoints(rx, meta).await,
+        Aggregation::Mean => todo!(),
+        Aggregation::Mode => todo!(),
+        Aggregation::Median => todo!(),
+        Aggregation::Min => todo!(),
+        Aggregation::Max => todo!(),
+    });
 }
 impl Storage {
     fn get_partitions_in_range(&self, start_unix_s: i64, stop_unix_s: i64) -> Vec<&TimePartition> {
