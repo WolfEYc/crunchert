@@ -1,8 +1,9 @@
 use dashmap::DashMap;
-use prost::UnknownEnumValue;
+use pco::standalone::simple_decompress;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::usize;
-use std::{fmt::Debug, path::PathBuf, time::Duration};
+use std::{fmt::Debug, path::PathBuf};
 use tokio::task::JoinSet;
 
 use chrono::Utc;
@@ -13,29 +14,24 @@ use tokio::sync::RwLock;
 use crate::wolfey_metrics::{AggChartRequest, Aggregation, NonAggChartRequest};
 
 #[derive(Debug, Copy, Clone)]
-struct Datapoint {
-    unix_s: i64,
-    value: f32,
+pub struct Datapoint {
+    pub unix_s: i64,
+    pub value: f32,
 }
+
 struct DownsampledDatapoint {
     time_index: usize,
     value: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct CompressionOffset {
-    offset: Duration,
-    compression_level: usize,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct StorageConfig {
-    min_pts_to_compress: usize,
-    default_compression_level: usize,
-    retention_period_s: usize,
-    data_frequency_s: usize,
-    max_parallelism: usize,
-    stream_cache_ttl_s: usize,
+pub struct StorageConfig {
+    pub min_pts_to_compress: usize,
+    pub default_compression_level: usize,
+    pub retention_period_s: usize,
+    pub data_frequency_s: usize,
+    pub stream_cache_ttl_s: usize,
+    pub data_storage_dir: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,12 +56,20 @@ struct PartitionsFileHeader {
     time_partitions: Vec<TimePartitionFileHeader>,
 }
 
+#[derive(Default)]
 struct HotStream {
-    datapoints: Vec<Datapoint>,
+    unix_seconds: Vec<i64>,
+    values: Vec<f32>,
+}
+
+struct CompressedStream {
+    unix_s_bytes: Vec<u8>,
+    value_bytes: Vec<u8>,
 }
 
 struct Stream {
     disk_header: DiskStreamFileHeader,
+    compressed_stream: RwLock<Option<CompressedStream>>,
     hot_stream: RwLock<Option<HotStream>>,
 }
 
@@ -77,7 +81,7 @@ struct TimePartition {
 
 pub struct Storage {
     config: StorageConfig,
-    partitions: Vec<TimePartition>,
+    partitions: Vec<Arc<TimePartition>>,
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +100,7 @@ fn resolution(start_unix_s: i64, stop_unix_s: i64, step_s: u32) -> usize {
 }
 
 impl ChartReqMetadata {
-    pub fn from_agg_chart_req(value: &AggChartRequest) -> Self {
+    fn from_agg_chart_req(value: &AggChartRequest) -> Self {
         Self {
             start_unix_s: value.start_unix_s,
             stop_unix_s: value.stop_unix_s,
@@ -104,7 +108,7 @@ impl ChartReqMetadata {
             resolution: resolution(value.start_unix_s, value.stop_unix_s, value.step_s),
         }
     }
-    pub fn from_non_agg_chart_req(value: &NonAggChartRequest) -> Self {
+    fn from_non_agg_chart_req(value: &NonAggChartRequest) -> Self {
         Self {
             start_unix_s: value.start_unix_s,
             stop_unix_s: value.stop_unix_s,
@@ -121,34 +125,46 @@ impl Default for StorageConfig {
             default_compression_level: 8,
             retention_period_s: 7776000,
             data_frequency_s: 900,
-            max_parallelism: num_cpus::get(),
             stream_cache_ttl_s: 900,
-        }
-    }
-}
-
-impl HotStream {
-    pub async fn send_agg_chart(&self, req: ChartReqMetadata, tx: &Sender<DownsampledDatapoint>) {
-        for pt in &self.datapoints {
-            //TODO: only send downsampled pts, with time index
-            let _ = tx
-                .send(DownsampledDatapoint {
-                    time_index: 1,
-                    value: pt.value,
-                })
-                .await;
+            data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
         }
     }
 }
 
 impl DiskStreamFileHeader {
-    async fn get_hot_stream_from_disk(&self, file_path: &PathBuf) -> HotStream {
+    async fn get_compressed_stream_from_disk(&self, file_path: &PathBuf) -> CompressedStream {
+        todo!()
+    }
+}
+
+impl CompressedStream {
+    fn decompress(&self) -> HotStream {
+        let Ok(unix_s_decompressed) = simple_decompress(&self.unix_s_bytes) else {
+            return HotStream::default();
+        };
+        let Ok(values_decompressed) = simple_decompress(&self.value_bytes) else {
+            return HotStream::default();
+        };
+
+        HotStream {
+            unix_seconds: unix_s_decompressed,
+            values: values_decompressed,
+        }
+    }
+}
+
+impl HotStream {
+    async fn hotstream_transmit_agg_chart(
+        &self,
+        req: ChartReqMetadata,
+        tx: &Sender<DownsampledDatapoint>,
+    ) {
         todo!()
     }
 }
 
 impl Stream {
-    pub async fn get_agg_chart(
+    async fn stream_transmit_agg_chart(
         &self,
         req: ChartReqMetadata,
         tx: &Sender<DownsampledDatapoint>,
@@ -156,20 +172,47 @@ impl Stream {
     ) {
         let hot_stream_option = self.hot_stream.read().await;
         if let Some(ref x) = *hot_stream_option {
-            x.send_agg_chart(req, &tx).await;
+            x.hotstream_transmit_agg_chart(req, &tx).await;
             return;
         }
+        drop(hot_stream_option);
 
         let mut writable_hot_stream = self.hot_stream.write().await;
 
         if let Some(ref x) = *writable_hot_stream {
-            x.send_agg_chart(req, &tx).await;
+            x.hotstream_transmit_agg_chart(req, &tx).await;
             return;
         }
 
-        let hot_stream_from_disk = self.disk_header.get_hot_stream_from_disk(file_path).await;
-        hot_stream_from_disk.send_agg_chart(req, &tx).await;
-        *writable_hot_stream = Some(hot_stream_from_disk);
+        let compressed_stream_option = self.compressed_stream.read().await;
+
+        if let Some(ref x) = *compressed_stream_option {
+            let hot_stream = x.decompress();
+            *writable_hot_stream = Some(hot_stream);
+            return;
+        }
+
+        drop(compressed_stream_option);
+
+        let mut writable_compressed_stream = self.compressed_stream.write().await;
+
+        if let Some(ref x) = *writable_compressed_stream {
+            let hot_stream = x.decompress();
+            *writable_hot_stream = Some(hot_stream);
+            return;
+        }
+
+        let compressed_stream_from_disk = self
+            .disk_header
+            .get_compressed_stream_from_disk(file_path)
+            .await;
+
+        let hot_stream = compressed_stream_from_disk.decompress();
+        *writable_compressed_stream = Some(compressed_stream_from_disk);
+        drop(writable_compressed_stream);
+
+        hot_stream.hotstream_transmit_agg_chart(req, &tx).await;
+        *writable_hot_stream = Some(hot_stream);
     }
 }
 
@@ -181,6 +224,7 @@ impl From<TimePartitionFileHeader> for TimePartition {
                 x.stream_id,
                 Stream {
                     disk_header: x,
+                    compressed_stream: RwLock::new(None),
                     hot_stream: RwLock::new(None),
                 },
             );
@@ -191,21 +235,6 @@ impl From<TimePartitionFileHeader> for TimePartition {
             file_path: value.file_path,
         }
     }
-}
-
-async fn get_agg_chart_from_partition(
-    stream_id: u64,
-    time_partition: Arc<TimePartition>,
-    meta: ChartReqMetadata,
-    tx: Sender<DownsampledDatapoint>,
-) {
-    let Some(stream) = time_partition.streams.get(&stream_id) else {
-        return;
-    };
-
-    stream
-        .get_agg_chart(meta, &tx, &time_partition.file_path)
-        .await;
 }
 
 async fn sum_datapoints(
@@ -222,6 +251,7 @@ async fn sum_datapoints(
                 Some(x) => Some(pt.value + x),
             };
         }
+        buffer.clear();
     }
 
     let datapoints = chart_values
@@ -239,33 +269,53 @@ async fn sum_datapoints(
     return datapoints;
 }
 
-async fn get_agg_chart_from_partition_bulk(
+async fn time_partition_transmit_stream(
+    stream_id: u64,
     time_partition: Arc<TimePartition>,
-    req: AggChartRequest,
-) -> Result<Vec<Datapoint>, UnknownEnumValue> {
+    meta: ChartReqMetadata,
+    tx: Sender<DownsampledDatapoint>,
+) {
+    let Some(stream) = time_partition.streams.get(&stream_id) else {
+        return;
+    };
+
+    stream
+        .stream_transmit_agg_chart(meta, &tx, &time_partition.file_path)
+        .await;
+}
+
+async fn time_partition_get_agg_chart(
+    time_partition: Arc<TimePartition>,
+    req: Arc<AggChartRequest>,
+    agg: Aggregation,
+) -> Vec<Datapoint> {
     let meta = ChartReqMetadata::from_agg_chart_req(&req);
 
     let (tx, rx) = channel(meta.resolution);
     let coros = req
         .stream_ids
-        .into_iter()
-        .map(|x| get_agg_chart_from_partition(x, time_partition.clone(), meta, tx.clone()));
+        .iter()
+        .map(|x| time_partition_transmit_stream(*x, time_partition.clone(), meta, tx.clone()));
 
     let joinset = JoinSet::from_iter(coros);
     tokio::spawn(joinset.join_all());
-    let aggregation = Aggregation::try_from(req.aggregation)?;
 
-    return Ok(match aggregation {
+    match agg {
         Aggregation::Sum => sum_datapoints(rx, meta).await,
         Aggregation::Mean => todo!(),
         Aggregation::Mode => todo!(),
         Aggregation::Median => todo!(),
         Aggregation::Min => todo!(),
         Aggregation::Max => todo!(),
-    });
+    }
 }
+
 impl Storage {
-    fn get_partitions_in_range(&self, start_unix_s: i64, stop_unix_s: i64) -> Vec<&TimePartition> {
+    fn get_partitions_in_range(
+        &self,
+        start_unix_s: i64,
+        stop_unix_s: i64,
+    ) -> Vec<Arc<TimePartition>> {
         let mut partition_end = Utc::now().timestamp();
         let mut partitions_in_range = Vec::new();
         for partition in &self.partitions {
@@ -276,8 +326,22 @@ impl Storage {
             if stop_unix_s < partition.start_unix_s {
                 continue;
             }
-            partitions_in_range.push(partition);
+            partitions_in_range.push(partition.clone());
         }
         return partitions_in_range;
+    }
+
+    pub async fn get_agg_chart(&self, req: AggChartRequest, agg: Aggregation) -> Vec<Datapoint> {
+        let time_partitions = self.get_partitions_in_range(req.start_unix_s, req.stop_unix_s);
+        let arc_req = Arc::new(req);
+        let datapoint_jobs = time_partitions
+            .into_iter()
+            .map(|x| time_partition_get_agg_chart(x, arc_req.clone(), agg));
+        let datapoints_nested = JoinSet::from_iter(datapoint_jobs).join_all().await;
+        let datapoints_flattened = datapoints_nested.into_iter().flatten().collect();
+        return datapoints_flattened;
+    }
+    pub fn new(config: StorageConfig) -> Self {
+        todo!()
     }
 }

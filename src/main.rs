@@ -1,3 +1,7 @@
+use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
 use tonic::{transport::Server, Request, Response, Status};
 
 use tonic::Streaming;
@@ -6,13 +10,16 @@ use wolfey_metrics::{
     AggChartReply, AggChartRequest, ImportReply, ImportRequest,
 };
 use wolfey_metrics::{NonAggChartReply, NonAggChartRequest};
+use wolfeystorage::{Storage, StorageConfig};
 
-pub mod wolfey_metrics {
+mod wolfey_metrics {
     tonic::include_proto!("wolfeymetrics"); // The string specified here must match the proto package name
 }
 mod wolfeystorage;
-#[derive(Debug, Default)]
-pub struct WolfeyMetricsService {}
+
+struct WolfeyMetricsService {
+    storage: Arc<Storage>,
+}
 
 #[tonic::async_trait]
 impl WolfeyMetrics for WolfeyMetricsService {
@@ -48,13 +55,20 @@ impl WolfeyMetrics for WolfeyMetricsService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
-    let service = WolfeyMetricsService::default();
+    let port = match env::var("PORT") {
+        Ok(x) => x.parse()?,
+        Err(_) => 50051,
+    };
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
 
-    Server::builder()
-        .add_service(WolfeyMetricsServer::new(service))
-        .serve(addr)
-        .await?;
+    let config = envy::from_env::<StorageConfig>()?;
+    let storage = Storage::new(config);
+    let service = WolfeyMetricsService {
+        storage: storage.into(),
+    };
+    let server = WolfeyMetricsServer::new(service);
+
+    Server::builder().add_service(server).serve(addr).await?;
 
     Ok(())
 }
