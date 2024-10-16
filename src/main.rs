@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
 
     let config = envy::from_env::<StorageConfig>()?;
-    let storage = Storage::new(config);
+    let storage = Storage::new(config)?;
     let service = WolfeyMetricsService {
         storage: storage.into(),
     };

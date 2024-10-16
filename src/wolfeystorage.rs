@@ -1,9 +1,11 @@
+use core::error;
 use dashmap::DashMap;
 use pco::standalone::simple_decompress;
-use std::str::FromStr;
+use postcard::from_bytes;
+use serde::de::Error;
 use std::sync::Arc;
-use std::usize;
 use std::{fmt::Debug, path::PathBuf};
+use std::{io, usize};
 use tokio::task::JoinSet;
 
 use chrono::Utc;
@@ -12,6 +14,9 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::wolfey_metrics::{AggChartRequest, Aggregation, NonAggChartRequest};
+
+const PARTITIONS_FILE_HEADER_FILENAME: &str = "WolfeyPartitionsConfig";
+const MIN_PTS_TO_COMPRESS: usize = 10_000;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Datapoint {
@@ -26,9 +31,9 @@ struct DownsampledDatapoint {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StorageConfig {
-    pub min_pts_to_compress: usize,
-    pub default_compression_level: usize,
+    pub compression_level: usize,
     pub retention_period_s: usize,
+    pub cold_storage_after_s: usize,
     pub data_frequency_s: usize,
     pub stream_cache_ttl_s: usize,
     pub data_storage_dir: PathBuf,
@@ -50,10 +55,33 @@ struct TimePartitionFileHeader {
     disk_streams: Vec<DiskStreamFileHeader>,
 }
 
+impl TimePartitionFileHeader {
+    fn new(config: &StorageConfig) -> Self {
+        let now = Utc::now().timestamp();
+        let file_path = config.data_storage_dir.join(now.to_string());
+        Self {
+            start_unix_s: now,
+            file_path,
+            disk_streams: Default::default(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PartitionsFileHeader {
     // sorted descending start_unix_s
     time_partitions: Vec<TimePartitionFileHeader>,
+}
+
+impl PartitionsFileHeader {
+    fn new(config: &StorageConfig) -> Self {
+        Self {
+            time_partitions: vec![TimePartitionFileHeader::new(config)],
+        }
+    }
+    fn thaw(&self, config: &StorageConfig) -> Vec<Arc<TimePartition>> {
+        todo!()
+    }
 }
 
 #[derive(Default)]
@@ -82,6 +110,7 @@ struct TimePartition {
 pub struct Storage {
     config: StorageConfig,
     partitions: Vec<Arc<TimePartition>>,
+    partition_file_header: PartitionsFileHeader,
 }
 
 #[derive(Clone, Copy)]
@@ -121,13 +150,73 @@ impl ChartReqMetadata {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            min_pts_to_compress: 10_000,
-            default_compression_level: 8,
+            compression_level: 8,
             retention_period_s: 7776000,
+            cold_storage_after_s: 7776000,
             data_frequency_s: 900,
             stream_cache_ttl_s: 900,
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
         }
+    }
+}
+
+const MIN_COMPRESSION_LEVEL: usize = 4;
+const MAX_COMPRESSION_LEVEL: usize = 12;
+const MIN_RETENTION_PERIOD_S: usize = 900; //15m
+const MIN_COLD_STORAGE_S: usize = 7776000; //90d
+const MAX_RETENTION_PERIOD_S: usize = 3156000000; //100y
+const MAX_DATA_FREQUENCY_S: usize = 604800; //7d
+
+#[derive(thiserror::Error, Debug)]
+pub enum StorageConfigError {
+    #[error("COMPRESSION_LEVEL must be >= {MIN_COMPRESSION_LEVEL}")]
+    ToLowCompressionLevel,
+    #[error("COMPRESSION_LEVEL must be <= {MAX_COMPRESSION_LEVEL}")]
+    ToHighCompressionLevel,
+    #[error("RETENTION_PERIOD must be >= {MIN_RETENTION_PERIOD_S}")]
+    ToLowRetentionPeriod,
+    #[error("RETENTION_PERIOD must be <= {MAX_RETENTION_PERIOD_S}")]
+    ToHighRetentionPeriod,
+    #[error("RETENTION_PERIOD_S must be >= COLD_STORAGE_AFTER_S")]
+    ColdStorageCannotBeGreaterThanRetention,
+    #[error("COLD_STORAGE_AFTER_S must be >= {MIN_COLD_STORAGE_S} or RETENTION_PERIOD_S")]
+    ColdStorageTooLow,
+    #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
+    DataFrequencyTooHigh,
+}
+
+impl StorageConfig {
+    fn validate(self) -> Result<Self, StorageConfigError> {
+        if self.compression_level < MIN_COMPRESSION_LEVEL {
+            return Err(StorageConfigError::ToLowCompressionLevel);
+        }
+
+        if self.compression_level > MAX_COMPRESSION_LEVEL {
+            return Err(StorageConfigError::ToHighCompressionLevel);
+        }
+
+        if self.retention_period_s < MIN_RETENTION_PERIOD_S {
+            return Err(StorageConfigError::ToLowRetentionPeriod);
+        }
+        if self.retention_period_s > MAX_RETENTION_PERIOD_S {
+            return Err(StorageConfigError::ToHighRetentionPeriod);
+        }
+
+        if self.retention_period_s < self.cold_storage_after_s {
+            return Err(StorageConfigError::ColdStorageCannotBeGreaterThanRetention);
+        }
+
+        let min_cold_storage_s = std::cmp::min(MIN_COLD_STORAGE_S, self.retention_period_s);
+
+        if self.cold_storage_after_s < min_cold_storage_s {
+            return Err(StorageConfigError::ColdStorageTooLow);
+        }
+
+        if self.data_frequency_s > MAX_DATA_FREQUENCY_S {
+            return Err(StorageConfigError::DataFrequencyTooHigh);
+        }
+
+        Ok(self)
     }
 }
 
@@ -341,7 +430,25 @@ impl Storage {
         let datapoints_flattened = datapoints_nested.into_iter().flatten().collect();
         return datapoints_flattened;
     }
-    pub fn new(config: StorageConfig) -> Self {
-        todo!()
+    pub fn new(config: StorageConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = config.validate()?;
+        let partitions_file_path = config
+            .data_storage_dir
+            .join(PARTITIONS_FILE_HEADER_FILENAME);
+
+        let partition_file_header: PartitionsFileHeader = if partitions_file_path.exists() {
+            let partitions_file_header_bytes = std::fs::read(partitions_file_path)?;
+            from_bytes(&partitions_file_header_bytes)?
+        } else {
+            PartitionsFileHeader::new(&config)
+        };
+
+        let partitions = partition_file_header.thaw(&config);
+
+        Ok(Self {
+            config,
+            partitions,
+            partition_file_header,
+        })
     }
 }
