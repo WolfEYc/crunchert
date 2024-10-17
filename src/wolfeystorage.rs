@@ -1,11 +1,13 @@
-use core::error;
 use dashmap::DashMap;
+use itertools::{process_results, Itertools};
+use memmap2::Mmap;
 use pco::standalone::simple_decompress;
 use postcard::from_bytes;
-use serde::de::Error;
+use serde::de::value::Error;
+
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
-use std::{io, usize};
+use std::{fs, io, usize};
 use tokio::task::JoinSet;
 
 use chrono::Utc;
@@ -39,7 +41,7 @@ pub struct StorageConfig {
     pub data_storage_dir: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 struct DiskStreamFileHeader {
     stream_id: u64,
     unix_s_byte_start: usize,
@@ -48,7 +50,7 @@ struct DiskStreamFileHeader {
     compressed: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TimePartitionFileHeader {
     start_unix_s: i64,
     file_path: PathBuf,
@@ -73,37 +75,20 @@ struct PartitionsFileHeader {
     time_partitions: Vec<TimePartitionFileHeader>,
 }
 
-impl PartitionsFileHeader {
-    fn new(config: &StorageConfig) -> Self {
-        Self {
-            time_partitions: vec![TimePartitionFileHeader::new(config)],
-        }
-    }
-    fn thaw(&self, config: &StorageConfig) -> Vec<Arc<TimePartition>> {
-        todo!()
-    }
-}
-
 #[derive(Default)]
 struct HotStream {
     unix_seconds: Vec<i64>,
     values: Vec<f32>,
 }
 
-struct CompressedStream {
-    unix_s_bytes: Vec<u8>,
-    value_bytes: Vec<u8>,
-}
-
 struct Stream {
     disk_header: DiskStreamFileHeader,
-    compressed_stream: RwLock<Option<CompressedStream>>,
     hot_stream: RwLock<Option<HotStream>>,
 }
 
 struct TimePartition {
     start_unix_s: i64,
-    file_path: PathBuf,
+    mmap: Mmap,
     streams: DashMap<u64, Stream>,
 }
 
@@ -151,8 +136,8 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             compression_level: 8,
-            retention_period_s: 7776000,
-            cold_storage_after_s: 7776000,
+            retention_period_s: 31104000,  //1y
+            cold_storage_after_s: 7776000, //90d
             data_frequency_s: 900,
             stream_cache_ttl_s: 900,
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
@@ -221,17 +206,14 @@ impl StorageConfig {
 }
 
 impl DiskStreamFileHeader {
-    async fn get_compressed_stream_from_disk(&self, file_path: &PathBuf) -> CompressedStream {
-        todo!()
-    }
-}
+    fn read_stream_from_mmap(&self, mmap: &Mmap) -> HotStream {
+        let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];
+        let value_bytes = &mmap[self.unix_s_byte_stop..self.values_byte_stop];
 
-impl CompressedStream {
-    fn decompress(&self) -> HotStream {
-        let Ok(unix_s_decompressed) = simple_decompress(&self.unix_s_bytes) else {
+        let Ok(unix_s_decompressed) = simple_decompress(unix_s_bytes) else {
             return HotStream::default();
         };
-        let Ok(values_decompressed) = simple_decompress(&self.value_bytes) else {
+        let Ok(values_decompressed) = simple_decompress(value_bytes) else {
             return HotStream::default();
         };
 
@@ -257,7 +239,7 @@ impl Stream {
         &self,
         req: ChartReqMetadata,
         tx: &Sender<DownsampledDatapoint>,
-        file_path: &PathBuf,
+        mmap: &Mmap,
     ) {
         let hot_stream_option = self.hot_stream.read().await;
         if let Some(ref x) = *hot_stream_option {
@@ -273,56 +255,10 @@ impl Stream {
             return;
         }
 
-        let compressed_stream_option = self.compressed_stream.read().await;
-
-        if let Some(ref x) = *compressed_stream_option {
-            let hot_stream = x.decompress();
-            *writable_hot_stream = Some(hot_stream);
-            return;
-        }
-
-        drop(compressed_stream_option);
-
-        let mut writable_compressed_stream = self.compressed_stream.write().await;
-
-        if let Some(ref x) = *writable_compressed_stream {
-            let hot_stream = x.decompress();
-            *writable_hot_stream = Some(hot_stream);
-            return;
-        }
-
-        let compressed_stream_from_disk = self
-            .disk_header
-            .get_compressed_stream_from_disk(file_path)
-            .await;
-
-        let hot_stream = compressed_stream_from_disk.decompress();
-        *writable_compressed_stream = Some(compressed_stream_from_disk);
-        drop(writable_compressed_stream);
+        let hot_stream = self.disk_header.read_stream_from_mmap(mmap);
 
         hot_stream.hotstream_transmit_agg_chart(req, &tx).await;
         *writable_hot_stream = Some(hot_stream);
-    }
-}
-
-impl From<TimePartitionFileHeader> for TimePartition {
-    fn from(value: TimePartitionFileHeader) -> Self {
-        let hash_map = DashMap::new();
-        for x in value.disk_streams {
-            hash_map.insert(
-                x.stream_id,
-                Stream {
-                    disk_header: x,
-                    compressed_stream: RwLock::new(None),
-                    hot_stream: RwLock::new(None),
-                },
-            );
-        }
-        Self {
-            start_unix_s: value.start_unix_s,
-            streams: hash_map,
-            file_path: value.file_path,
-        }
     }
 }
 
@@ -369,7 +305,7 @@ async fn time_partition_transmit_stream(
     };
 
     stream
-        .stream_transmit_agg_chart(meta, &tx, &time_partition.file_path)
+        .stream_transmit_agg_chart(meta, &tx, &time_partition.mmap)
         .await;
 }
 
@@ -396,6 +332,46 @@ async fn time_partition_get_agg_chart(
         Aggregation::Median => todo!(),
         Aggregation::Min => todo!(),
         Aggregation::Max => todo!(),
+    }
+}
+
+impl TryFrom<&TimePartitionFileHeader> for TimePartition {
+    type Error = io::Error;
+    fn try_from(value: &TimePartitionFileHeader) -> Result<Self, Self::Error> {
+        let hash_map = DashMap::new();
+        for x in &value.disk_streams {
+            hash_map.insert(
+                x.stream_id,
+                Stream {
+                    disk_header: x.clone(),
+                    hot_stream: RwLock::new(None),
+                },
+            );
+        }
+        let file = fs::File::open(&value.file_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            start_unix_s: value.start_unix_s,
+            streams: hash_map,
+            mmap: mmap,
+        })
+    }
+}
+
+impl PartitionsFileHeader {
+    fn new(config: &StorageConfig) -> Self {
+        Self {
+            time_partitions: vec![TimePartitionFileHeader::new(config)],
+        }
+    }
+    fn thaw(&self, config: &StorageConfig) -> Result<Vec<Arc<TimePartition>>, io::Error> {
+        let now = Utc::now().timestamp();
+        let cutoff = now - config.cold_storage_after_s as i64;
+        self.time_partitions
+            .iter()
+            .filter(|x| x.start_unix_s > cutoff)
+            .map(|x| x.try_into())
+            .process_results(|iter| iter.map(Arc::new).collect())
     }
 }
 
@@ -430,6 +406,7 @@ impl Storage {
         let datapoints_flattened = datapoints_nested.into_iter().flatten().collect();
         return datapoints_flattened;
     }
+
     pub fn new(config: StorageConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let config = config.validate()?;
         let partitions_file_path = config
@@ -443,7 +420,7 @@ impl Storage {
             PartitionsFileHeader::new(&config)
         };
 
-        let partitions = partition_file_header.thaw(&config);
+        let partitions = partition_file_header.thaw(&config)?;
 
         Ok(Self {
             config,

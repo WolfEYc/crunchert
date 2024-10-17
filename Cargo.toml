@@ -15,6 +15,8 @@ envy = "0.4.2"
 tracing-subscriber = "0.3.18"
 postcard = "1.0.10"
 thiserror = "1.0.64"
+memmap2 = "0.9.5"
+itertools = "0.13.0"
 
 
 [build-dependencies]
