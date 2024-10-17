@@ -5,6 +5,7 @@ use pco::standalone::simple_decompress;
 use postcard::from_bytes;
 use serde::de::value::Error;
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 use std::{fs, io, usize};
@@ -230,7 +231,18 @@ impl HotStream {
         req: ChartReqMetadata,
         tx: &Sender<DownsampledDatapoint>,
     ) {
-        todo!()
+        let start_iter = match self.unix_seconds.binary_search(&req.start_unix_s) {
+            Ok(x) => x,
+            Err(x) => x,
+        };
+        let stop_iter = match self.unix_seconds.binary_search(&req.stop_unix_s) {
+            Ok(x) => x,
+            Err(x) => x,
+        };
+
+        for (i, unix_s) in self.unix_seconds[start_iter..stop_iter].iter().enumerate() {
+            todo!()
+        }
     }
 }
 
