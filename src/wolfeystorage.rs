@@ -1,11 +1,9 @@
 use dashmap::DashMap;
-use itertools::{process_results, Itertools};
+use itertools::Itertools;
 use memmap2::Mmap;
 use pco::standalone::simple_decompress;
 use postcard::from_bytes;
-use serde::de::value::Error;
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 use std::{fs, io, usize};
@@ -13,13 +11,13 @@ use tokio::task::JoinSet;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::wolfey_metrics::{AggChartRequest, Aggregation, NonAggChartRequest};
 
 const PARTITIONS_FILE_HEADER_FILENAME: &str = "WolfeyPartitionsConfig";
 const MIN_PTS_TO_COMPRESS: usize = 10_000;
+const MIN_STREAMS_PER_THREAD: usize = 1000;
 
 #[derive(Debug, Copy, Clone)]
 pub struct Datapoint {
@@ -85,6 +83,7 @@ struct HotStream {
 struct Stream {
     disk_header: DiskStreamFileHeader,
     hot_stream: RwLock<Option<HotStream>>,
+    last_accessed: Mutex<Option<i64>>,
 }
 
 struct TimePartition {
@@ -95,8 +94,9 @@ struct TimePartition {
 
 pub struct Storage {
     config: StorageConfig,
-    partitions: Vec<Arc<TimePartition>>,
+    partitions: RwLock<Vec<Arc<TimePartition>>>,
     partition_file_header: PartitionsFileHeader,
+    num_threads: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -226,19 +226,20 @@ impl DiskStreamFileHeader {
 }
 
 impl HotStream {
-    async fn hotstream_transmit_agg_chart(
+    fn get_chart_aggregated(
         &self,
         req: ChartReqMetadata,
-        tx: &Sender<DownsampledDatapoint>,
+        aggregated_result: &mut [Option<f32>],
+        agg: Aggregation,
     ) {
-        let start_iter = match self.unix_seconds.binary_search(&req.start_unix_s) {
-            Ok(x) => x,
-            Err(x) => x,
-        };
-        let stop_iter = match self.unix_seconds.binary_search(&req.stop_unix_s) {
-            Ok(x) => x,
-            Err(x) => x,
-        };
+        let start_iter = self
+            .unix_seconds
+            .binary_search(&req.start_unix_s)
+            .unwrap_or_else(|x| x);
+        let stop_iter = self
+            .unix_seconds
+            .binary_search(&req.stop_unix_s)
+            .unwrap_or_else(|x| x);
 
         for (i, unix_s) in self.unix_seconds[start_iter..stop_iter].iter().enumerate() {
             todo!()
@@ -247,15 +248,16 @@ impl HotStream {
 }
 
 impl Stream {
-    async fn stream_transmit_agg_chart(
+    async fn get_chart_aggregated(
         &self,
         req: ChartReqMetadata,
-        tx: &Sender<DownsampledDatapoint>,
         mmap: &Mmap,
+        aggregated_result: &mut [Option<f32>],
+        agg: Aggregation,
     ) {
         let hot_stream_option = self.hot_stream.read().await;
         if let Some(ref x) = *hot_stream_option {
-            x.hotstream_transmit_agg_chart(req, &tx).await;
+            x.get_chart_aggregated(req, aggregated_result, agg);
             return;
         }
         drop(hot_stream_option);
@@ -263,88 +265,73 @@ impl Stream {
         let mut writable_hot_stream = self.hot_stream.write().await;
 
         if let Some(ref x) = *writable_hot_stream {
-            x.hotstream_transmit_agg_chart(req, &tx).await;
+            x.get_chart_aggregated(req, aggregated_result, agg);
             return;
         }
 
         let hot_stream = self.disk_header.read_stream_from_mmap(mmap);
 
-        hot_stream.hotstream_transmit_agg_chart(req, &tx).await;
+        hot_stream.get_chart_aggregated(req, aggregated_result, agg);
         *writable_hot_stream = Some(hot_stream);
     }
 }
 
-async fn sum_datapoints(
-    mut rx: Receiver<DownsampledDatapoint>,
+async fn get_chart_aggregated_batched(
+    req: Arc<AggChartRequest>,
     meta: ChartReqMetadata,
-) -> Vec<Datapoint> {
-    let mut buffer: Vec<DownsampledDatapoint> = Vec::with_capacity(meta.resolution);
-    let mut chart_values: Vec<Option<f32>> = vec![None; meta.resolution];
-
-    while rx.recv_many(&mut buffer, meta.resolution).await != 0 {
-        for pt in &buffer {
-            chart_values[pt.time_index] = match chart_values[pt.time_index] {
-                None => Some(pt.value),
-                Some(x) => Some(pt.value + x),
-            };
-        }
-        buffer.clear();
-    }
-
-    let datapoints = chart_values
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, value)| match value {
-            Some(x) => Some(Datapoint {
-                unix_s: meta.start_unix_s + (meta.step_s as usize * idx) as i64,
-                value: x,
-            }),
-            None => None,
-        })
-        .collect();
-
-    return datapoints;
-}
-
-async fn time_partition_transmit_stream(
-    stream_id: u64,
+    agg: Aggregation,
+    thread_idx: usize,
+    num_threads: usize,
     time_partition: Arc<TimePartition>,
-    meta: ChartReqMetadata,
-    tx: Sender<DownsampledDatapoint>,
-) {
-    let Some(stream) = time_partition.streams.get(&stream_id) else {
-        return;
+) -> Vec<Option<f32>> {
+    let streams_per_thread = req.stream_ids.len() / num_threads;
+    let start_idx = streams_per_thread * thread_idx;
+    let stop_idx = if thread_idx == num_threads - 1 {
+        req.stream_ids.len()
+    } else {
+        streams_per_thread * (thread_idx + 1)
     };
+    // TODO double check the previous math
 
-    stream
-        .stream_transmit_agg_chart(meta, &tx, &time_partition.mmap)
-        .await;
+    let streams = req.stream_ids[start_idx..stop_idx]
+        .iter()
+        .filter_map(|x| time_partition.streams.get(x));
+
+    let mut aggregated_batch: Vec<Option<f32>> = vec![None; meta.resolution];
+    for stream in streams {
+        stream
+            .get_chart_aggregated(meta, &time_partition.mmap, &mut aggregated_batch, agg)
+            .await;
+    }
+    return aggregated_batch;
 }
 
 async fn time_partition_get_agg_chart(
     time_partition: Arc<TimePartition>,
     req: Arc<AggChartRequest>,
     agg: Aggregation,
+    num_threads: usize,
 ) -> Vec<Datapoint> {
     let meta = ChartReqMetadata::from_agg_chart_req(&req);
 
-    let (tx, rx) = channel(meta.resolution);
-    let coros = req
-        .stream_ids
-        .iter()
-        .map(|x| time_partition_transmit_stream(*x, time_partition.clone(), meta, tx.clone()));
+    let threads_requested = req.stream_ids.len() / MIN_STREAMS_PER_THREAD;
+    let threads_capped = std::cmp::min(threads_requested, num_threads);
+    let num_threads = std::cmp::max(threads_capped, 1);
 
-    let joinset = JoinSet::from_iter(coros);
-    tokio::spawn(joinset.join_all());
+    let batches = (0..num_threads).map(|x| {
+        get_chart_aggregated_batched(
+            req.clone(),
+            meta,
+            agg,
+            x,
+            num_threads,
+            time_partition.clone(),
+        )
+    });
 
-    match agg {
-        Aggregation::Sum => sum_datapoints(rx, meta).await,
-        Aggregation::Mean => todo!(),
-        Aggregation::Mode => todo!(),
-        Aggregation::Median => todo!(),
-        Aggregation::Min => todo!(),
-        Aggregation::Max => todo!(),
-    }
+    let results_in_agg_batches = JoinSet::from_iter(batches).join_all().await;
+
+    todo!()
 }
 
 impl TryFrom<&TimePartitionFileHeader> for TimePartition {
@@ -357,6 +344,7 @@ impl TryFrom<&TimePartitionFileHeader> for TimePartition {
                 Stream {
                     disk_header: x.clone(),
                     hot_stream: RwLock::new(None),
+                    last_accessed: Mutex::new(None),
                 },
             );
         }
@@ -388,14 +376,15 @@ impl PartitionsFileHeader {
 }
 
 impl Storage {
-    fn get_partitions_in_range(
+    async fn get_partitions_in_range(
         &self,
         start_unix_s: i64,
         stop_unix_s: i64,
     ) -> Vec<Arc<TimePartition>> {
         let mut partition_end = Utc::now().timestamp();
         let mut partitions_in_range = Vec::new();
-        for partition in &self.partitions {
+        let partitions = self.partitions.read().await;
+        for partition in partitions.iter() {
             if start_unix_s > partition_end {
                 return partitions_in_range;
             }
@@ -409,17 +398,22 @@ impl Storage {
     }
 
     pub async fn get_agg_chart(&self, req: AggChartRequest, agg: Aggregation) -> Vec<Datapoint> {
-        let time_partitions = self.get_partitions_in_range(req.start_unix_s, req.stop_unix_s);
+        let time_partitions = self
+            .get_partitions_in_range(req.start_unix_s, req.stop_unix_s)
+            .await;
         let arc_req = Arc::new(req);
         let datapoint_jobs = time_partitions
             .into_iter()
-            .map(|x| time_partition_get_agg_chart(x, arc_req.clone(), agg));
+            .map(|x| time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads));
         let datapoints_nested = JoinSet::from_iter(datapoint_jobs).join_all().await;
         let datapoints_flattened = datapoints_nested.into_iter().flatten().collect();
         return datapoints_flattened;
     }
 
-    pub fn new(config: StorageConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        config: StorageConfig,
+        num_threads: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = config.validate()?;
         let partitions_file_path = config
             .data_storage_dir
@@ -432,12 +426,13 @@ impl Storage {
             PartitionsFileHeader::new(&config)
         };
 
-        let partitions = partition_file_header.thaw(&config)?;
+        let partitions = RwLock::new(partition_file_header.thaw(&config)?);
 
         Ok(Self {
             config,
             partitions,
             partition_file_header,
+            num_threads: num_threads,
         })
     }
 }

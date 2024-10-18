@@ -2,6 +2,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use tokio::runtime::Handle;
 use tonic::{transport::Server, Request, Response, Status};
 
 use tonic::Streaming;
@@ -55,6 +56,9 @@ impl WolfeyMetrics for WolfeyMetricsService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let metrics = Handle::current().metrics();
+
+    let num_threads = metrics.num_workers();
     let port = match env::var("PORT") {
         Ok(x) => x.parse()?,
         Err(_) => 50051,
@@ -62,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
 
     let config = envy::from_env::<StorageConfig>()?;
-    let storage = Storage::new(config)?;
+    let storage = Storage::new(config, num_threads)?;
     let service = WolfeyMetricsService {
         storage: storage.into(),
     };

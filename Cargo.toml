@@ -17,6 +17,7 @@ postcard = "1.0.10"
 thiserror = "1.0.64"
 memmap2 = "0.9.5"
 itertools = "0.13.0"
+bumpalo = "3.16.0"
 
 
 [build-dependencies]
