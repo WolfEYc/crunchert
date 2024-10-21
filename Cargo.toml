@@ -12,6 +12,7 @@ tokio = { version = "1.40.0", features = ["full", "tracing"] }
 tracing-subscriber = "0.3.18"
 envy = "0.4.2"
 crunchert-storage = "0.1.0"
+anyhow = "1.0.90"
 
 
 [build-dependencies]

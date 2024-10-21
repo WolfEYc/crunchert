@@ -56,7 +56,7 @@ impl Crunchert for CrunchertService {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let metrics = Handle::current().metrics();
 
     let num_threads = metrics.num_workers();
