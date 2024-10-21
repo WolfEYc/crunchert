@@ -5,34 +5,35 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tonic::{transport::Server, Request, Response, Status};
 
-use tonic::Streaming;
-use wolfey_metrics::{
-    wolfey_metrics_server::{WolfeyMetrics, WolfeyMetricsServer},
-    AggChartReply, AggChartRequest, ImportReply, ImportRequest,
+use crunchert::{
+    crunchert_server::{Crunchert, CrunchertServer},
+    AggChartReplyProto, AggChartRequestProto, ImportReplyProto, ImportRequestProto,
+    NonAggChartReplyProto, NonAggChartRequestProto,
 };
-use wolfey_metrics::{NonAggChartReply, NonAggChartRequest};
-use wolfeystorage::{Storage, StorageConfig};
+use tonic::Streaming;
 
-mod wolfey_metrics {
-    tonic::include_proto!("wolfeymetrics"); // The string specified here must match the proto package name
+use crunchert_storage::{Storage, StorageConfig};
+
+mod crunchert {
+    tonic::include_proto!("crunchert"); // The string specified here must match the proto package name
 }
-mod wolfeystorage;
 
-struct WolfeyMetricsService {
+#[derive(Clone)]
+struct CrunchertService {
     storage: Arc<Storage>,
 }
 
 #[tonic::async_trait]
-impl WolfeyMetrics for WolfeyMetricsService {
+impl Crunchert for CrunchertService {
     async fn import(
         &self,
-        request: Request<Streaming<ImportRequest>>, // Accept request of type HelloRequest
-    ) -> Result<Response<ImportReply>, Status> {
+        request: Request<Streaming<ImportRequestProto>>, // Accept request of type HelloRequest
+    ) -> Result<Response<ImportReplyProto>, Status> {
         // Return an instance of type HelloReply
         println!("Got a request: {:?}", request);
         let req = request.into_inner();
 
-        let reply = ImportReply {
+        let reply = ImportReplyProto {
             message: format!("got req {req:?}!"), // We must use .into_inner() as the fields of gRPC requests and responses are private
         };
 
@@ -41,15 +42,15 @@ impl WolfeyMetrics for WolfeyMetricsService {
 
     async fn non_agg_chart(
         &self,
-        request: Request<NonAggChartRequest>,
-    ) -> Result<Response<NonAggChartReply>, Status> {
+        request: Request<NonAggChartRequestProto>,
+    ) -> Result<Response<NonAggChartReplyProto>, Status> {
         todo!()
     }
 
     async fn agg_chart(
         &self,
-        request: Request<AggChartRequest>,
-    ) -> Result<Response<AggChartReply>, Status> {
+        request: Request<AggChartRequestProto>,
+    ) -> Result<Response<AggChartReplyProto>, Status> {
         todo!()
     }
 }
@@ -67,10 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = envy::from_env::<StorageConfig>()?;
     let storage = Storage::new(config, num_threads)?;
-    let service = WolfeyMetricsService {
+    let service = CrunchertService {
         storage: storage.into(),
     };
-    let server = WolfeyMetricsServer::new(service);
+    let server = CrunchertServer::new(service);
 
     Server::builder().add_service(server).serve(addr).await?;
 

@@ -1,5 +1,5 @@
 [package]
-name = "wolfeymetrics"
+name = "crunchert"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,16 +8,10 @@ tonic = "0.12.3"
 prost = "0.13.3"
 serde = { version = "1.0.210", features = ["derive"] }
 chrono = "0.4.38"
-dashmap = { version = "6.1.0", features = ["inline", "serde"] }
 tokio = { version = "1.40.0", features = ["full", "tracing"] }
-pco = "0.3.1"
-envy = "0.4.2"
 tracing-subscriber = "0.3.18"
-postcard = "1.0.10"
-thiserror = "1.0.64"
-memmap2 = "0.9.5"
-itertools = "0.13.0"
-bumpalo = "3.16.0"
+envy = "0.4.2"
+crunchert-storage = "0.1.0"
 
 
 [build-dependencies]
