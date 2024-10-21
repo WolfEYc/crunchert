@@ -270,9 +270,9 @@ dependencies = [
 
 [[package]]
 name = "crunchert-storage"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf8e0076b4a2b31173dcb7cd15631235209565a6952dc8e3d23ddc6605efa7a1"
+checksum = "9b3e383db8cc49cb885f59d9f15b59eac5e3544a039d23c92dee455f88ebd963"
 dependencies = [
  "chrono",
  "dashmap",
