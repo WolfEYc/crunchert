@@ -27,7 +27,7 @@ struct CrunchertService {
 impl Crunchert for CrunchertService {
     async fn import(
         &self,
-        request: Request<Streaming<ImportRequestProto>>, // Accept request of type HelloRequest
+        request: Request<ImportRequestProto>, // Accept request of type HelloRequest
     ) -> Result<Response<ImportReplyProto>, Status> {
         // Return an instance of type HelloReply
         println!("Got a request: {:?}", request);
